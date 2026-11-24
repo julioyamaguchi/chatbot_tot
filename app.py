@@ -1,6 +1,6 @@
 """
 Chatbot de Arquitetura de Sistemas com Tree of Thoughts.
-Etapa 1: chat "eco" (sem LLM) para entender o rerun e o session_state.
+Interface em Streamlit + Gemini com memória nativa (chats.create).
 """
 
 import os
@@ -8,7 +8,7 @@ import os
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
-from google.genai import types
+from google.genai import types, errors
 
 # ==============================================================================
 # CONFIGURAÇÃO INICIAL
@@ -17,7 +17,6 @@ from google.genai import types
 # Lê o arquivo .env e coloca as variáveis dentro de os.environ.
 load_dotenv()
 
-# Deve ser o PRIMEIRO comando do Streamlit no script.
 st.set_page_config(page_title="Arquiteto de Sistemas IA", page_icon="🏗️")
 
 st.title("🏗️ Arquiteto de Sistemas com Tree of Thoughts")
@@ -65,8 +64,23 @@ def obter_cliente(chave: str) -> genai.Client:
 
     O cliente não guarda estado de conversa, então pode ser compartilhado
     com segurança entre todas as sessões.
+
+    Falhas transitórias (limite de requisições 429 e erros 5xx do servidor)
+    são tentadas de novo automaticamente pelo SDK, com espera crescente
+    entre as tentativas (backoff exponencial). Erros permanentes, como chave
+    inválida (400/403), NÃO são repetidos e chegam direto ao try/except.
     """
-    return genai.Client(api_key=chave)
+    return genai.Client(
+        api_key=chave,
+        http_options=types.HttpOptions(
+            retry_options=types.HttpRetryOptions(
+                attempts=3,          # 1 tentativa original + até 2 novas tentativas
+                initial_delay=2.0,   # espera 2s antes da 2ª tentativa
+                exp_base=2.0,        # a espera dobra a cada nova tentativa (2s, 4s...)
+                max_delay=10.0,      # nunca espera mais que 10s entre tentativas
+            )
+        ),
+    )
 
 
 cliente = obter_cliente(chave_api)    
@@ -74,17 +88,22 @@ cliente = obter_cliente(chave_api)
 # ==============================================================================
 # FUNÇÃO AUXILIAR PARA DESENHAR UMA MENSAGEM
 # ==============================================================================
-# Avatar de cada papel. None = avatar padrão do Streamlit.
 
-def desenhar_mensagem(papel: str, conteudo: str) -> None:
+def desenhar_mensagem(papel: str, conteudo: str, erro: bool = False) -> None:
     """Desenha um balão de chat na tela.
 
     Usamos a MESMA função para redesenhar o histórico e para desenhar
-    as mensagens novas. Assim o visual (avatar) fica sempre igual.
+    as mensagens novas. Se a mensagem for um erro, ela aparece em vermelho.
     """
     with st.chat_message(papel):
-        st.markdown(conteudo)
+        if erro:
+            st.error(conteudo)
+        else:
+            st.markdown(conteudo)
 
+# ==============================================================================
+# FUNÇÃO AUXILIAR PARA RESPONDER PEGUNTAS
+# ==============================================================================
 
 def responder(pergunta: str) -> str:
     """Envia a pergunta ao Gemini e devolve o texto da resposta.
@@ -94,14 +113,42 @@ def responder(pergunta: str) -> str:
 
     ⚠️ PONTO DE EXTENSÃO: na Etapa 6, o Tree of Thoughts entra AQUI,
     substituindo esta chamada ingênua.
-    """
-    # TODO: envie a pergunta usando o chat guardado no session_state
-    #       e devolva só o texto da resposta.
-    #       (Lembre do notebook 07.1: chat.send_message(...) e .text)
-    ...        
+    """  
+
     chat = st.session_state.chat
     resposta = chat.send_message(pergunta)
-    return resposta.text.strip()
+    # Em casos raros (ex.: filtros de segurança), o texto vem None
+    texto = resposta.text
+    if not texto:
+        raise ValueError("O modelo devolveu uma resposta vazia.")
+
+    return texto.strip()
+
+def registrar_erro(texto: str) -> None:
+    """Mostra o erro na tela E o guarda no histórico visual
+
+    Assim, no próximo rerun, o usuário continua vendo o que aconteceu
+    com a pergunta que falhou.
+
+    Observação: o histórico DO MODELO não recebe nada, porque o objeto
+    Chat só registra pergunta e resposta quando a chamada dá certo.
+    """
+    st.error(texto)
+    st.session_state.mensagens.append(
+        {"role": "assistant", "content": texto, "erro": True}
+    )
+
+def nova_conversa() -> None:
+    """Reinicia a conversa apagando OS DOIS históricos.
+
+    É usada como callback (on_click) do botão: o Streamlit executa esta função
+    ANTES do rerun. Assim, quando o script roda de novo, as chaves já não
+    existem, e os PASSOS 1 e 1B recriam tudo vazio.
+    """
+    for chave in ("mensagens", "chat"):
+        # O "if" evita KeyError caso a chave, por algum motivo, já não exista
+        if chave in st.session_state:
+            del st.session_state[chave]    
 
 
 # ==============================================================================
@@ -132,7 +179,7 @@ if "chat" not in st.session_state:
 # Por isso, precisamos desenhar de novo TODAS as mensagens que já foram trocadas.
 for mensagem in st.session_state.mensagens:
     # O "role" guardado decide o avatar do balão ("user" ou "assistant")
-    desenhar_mensagem(mensagem["role"], mensagem["content"])
+    desenhar_mensagem(mensagem["role"], mensagem["content"], mensagem.get("erro", False))
 
 # ==============================================================================
 # PASSO 3: LER A ENTRADA DO USUÁRIO
@@ -145,29 +192,75 @@ pergunta = st.chat_input("Descreva seu problema de arquitetura...")
 # PASSO 4: PROCESSAR A PERGUNTA NOVA (só quando existe uma)
 # ==============================================================================
 if pergunta:
+
     # 4.1 Desenha a pergunta do usuário AGORA (o loop do passo 2 já passou)
     desenhar_mensagem("user", pergunta)
 
     # 4.2 Guarda a pergunta no histórico, para ser redesenhada nos próximos reruns
     st.session_state.mensagens.append({"role": "user", "content": pergunta})
 
-    # 4.3 Gera a resposta (por enquanto, só um eco; na Etapa 2 vira o Gemini)
-    resposta = responder(pergunta)
+    # 4.3 Abre o balão do assistente, mostra o spinner enquanto o Gemini
+    # processa, e escreve a resposta no mesmo balão quando ela chegar
+    with st.chat_message("assistant"):
+        try:
+            with st.spinner("Analisando arquiteturas possíveis..."):
+                resposta = responder(pergunta)
 
-    # 4.4 Desenha a resposta AGORA
-    desenhar_mensagem("assistant", resposta)
+            st.markdown(resposta)
+            # 4.4 Guarda a resposta no histórico
+            st.session_state.mensagens.append({"role": "assistant", "content": resposta})
 
-    # 4.5 Guarda a resposta no histórico
-    st.session_state.mensagens.append({"role": "assistant", "content": resposta})
+        except errors.ClientError as erro:
+            # Erros 4xx: o problema está do nosso lado (chave, cota, pedido)
+            if erro.code == 429:
+                registrar_erro(
+                    "⏳ Limite de requisições da API atingido. "
+                    "Aguarde cerca de um minuto e tente novamente."
+                )
+            elif erro.code in (400, 401, 403):
+                registrar_erro(
+                    "🔑 A chave da API é inválida ou não tem permissão. "
+                    "Verifique o valor de GEMINI_API_KEY no arquivo .env."
+                )
+            else:
+                registrar_erro(f"⚠️ Erro na requisição ao Gemini (código {erro.code}).")
+
+        except errors.ServerError as erro:
+            # Erros 5xx: o problema está do lado do Google
+            registrar_erro(
+                f"🛠️ O serviço do Gemini está indisponível no momento "
+                f"(código {erro.code}). Tente novamente em instantes."
+            )
+
+        except ValueError:
+            # Lançado pela responder() quando o modelo devolve um texto vazio
+            # (ex.: resposta bloqueada pelos filtros de segurança do Gemini)
+            registrar_erro(
+                "🤔 O modelo não conseguiu gerar uma resposta para esta pergunta. "
+                "Tente reformular."
+            )
+
+        except Exception as erro:
+            # Rede de segurança: sem internet, timeout ou qualquer erro inesperado
+            registrar_erro(
+                f"🌐 Não foi possível obter a resposta ({type(erro).__name__}). "
+                "Verifique sua conexão com a internet e tente novamente."
+            )
+    
 
 
 
 # ==============================================================================
-# DEPURAÇÃO: inspecionar o histórico que o GEMINI está recebendo
+# BARRA LATERAL: reiniciar a conversa e depuração
 # ==============================================================================
 with st.sidebar:
+    st.header("⚙️ Opções")
+
+    # on_click recebe a FUNÇÃO (sem parênteses): o Streamlit a chama no clique
+    st.button("🗑️ Nova conversa", on_click=nova_conversa)
+
     with st.expander("🧠 Memória do modelo (debug)"):
         historico_modelo = st.session_state.chat.get_history()
         st.caption(f"{len(historico_modelo)} mensagens na memória do Gemini")
         for item in historico_modelo:
-            st.markdown(f"**{item.role}:** {item.parts[0].text[:100]}...")    
+            st.markdown(f"**{item.role}:** {item.parts[0].text[:100]}...")
